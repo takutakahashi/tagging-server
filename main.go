@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -36,7 +38,7 @@ type Response struct {
 
 func main() {
 	// Open SQLite DB
-	db, err := sql.Open("sqlite3", "./targets_tags.db")
+	db, err := sql.Open("sqlite3", os.Getenv("DB_PATH"))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -69,8 +71,9 @@ func main() {
 	})
 
 	// Start the server
-	log.Println("Server started on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Println("Server started")
+	port := os.Getenv("PORT")
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", port), nil))
 }
 
 func hashAuthorizationKey(authKey string) string {
