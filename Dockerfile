@@ -1,5 +1,5 @@
 # Use the official Golang image as the base for building the binary
-FROM golang:1.23 as builder
+FROM golang:1.23-bullseye as builder
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -19,7 +19,7 @@ FROM litestream/litestream:latest as litestream
 FROM debian:bullseye
 
 # Install SQLite
-RUN apt-get update && apt-get install -y sqlite3 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates sqlite3 && rm -rf /var/lib/apt/lists/*
 
 # Set the working directory
 WORKDIR /app
