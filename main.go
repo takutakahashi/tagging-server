@@ -18,6 +18,8 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+var IV = []byte("1234b678902a34c6")
+
 // DB schema
 const createTableSQL = `
 CREATE TABLE IF NOT EXISTS targets_tags (
@@ -78,7 +80,7 @@ func main() {
 	http.HandleFunc("/new-key", func(w http.ResponseWriter, r *http.Request) {
 		key := newKey()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(base64.URLEncoding.EncodeToString(key))
+		json.NewEncoder(w).Encode(base64.URLEncoding.EncodeToString(key)[:32])
 	})
 
 	// Start the server
@@ -105,8 +107,13 @@ func handleGetTags(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		http.Error(w, "Missing target", http.StatusBadRequest)
 		return
 	}
+	encryptedTarget, err := encrypt(target, []byte(authKey))
+	if err != nil {
+		http.Error(w, "Failed to encrypt target", http.StatusInternalServerError)
+		return
+	}
 
-	rows, err := db.Query("SELECT tag FROM targets_tags WHERE encryption_key_hash = ? AND target = ?", keyHash, target)
+	rows, err := db.Query("SELECT tag FROM targets_tags WHERE encryption_key_hash = ? AND target = ?", keyHash, encryptedTarget)
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
@@ -147,7 +154,14 @@ func handleGetTargets(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
-	rows, err := db.Query("SELECT target FROM targets_tags WHERE encryption_key_hash = ? AND tag = ?", keyHash, tag)
+	// タグを暗号化してDBから検索
+	encryptedTag, err := encrypt(tag, []byte(authKey))
+	if err != nil {
+		http.Error(w, "Failed to encrypt tag", http.StatusInternalServerError)
+		return
+	}
+
+	rows, err := db.Query("SELECT target FROM targets_tags WHERE encryption_key_hash = ? AND tag = ?", keyHash, encryptedTag)
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
@@ -156,12 +170,12 @@ func handleGetTargets(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 	var targets []string
 	for rows.Next() {
-		var target string
-		if err := rows.Scan(&target); err != nil {
+		var encryptedTarget string
+		if err := rows.Scan(&encryptedTarget); err != nil {
 			http.Error(w, "Failed to read from database", http.StatusInternalServerError)
 			return
 		}
-		decryptedTarget, err := decrypt(target, []byte(authKey))
+		decryptedTarget, err := decrypt(encryptedTarget, []byte(authKey))
 		if err != nil {
 			http.Error(w, "Failed to decrypt target", http.StatusInternalServerError)
 			return
@@ -199,6 +213,7 @@ func handleAddTag(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 	target, err := encrypt(req.Target, []byte(authKey))
 	if err != nil {
+		log.Println(err)
 		http.Error(w, "Failed to encrypt target", http.StatusInternalServerError)
 		return
 	}
@@ -251,7 +266,6 @@ func handleLikeTarget(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 	w.WriteHeader(http.StatusOK)
 }
-
 func handleGetLikes(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	authKey := r.Header.Get("Authorization")
 	if authKey == "" {
@@ -265,13 +279,16 @@ func handleGetLikes(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		http.Error(w, "Missing target", http.StatusBadRequest)
 		return
 	}
-	decryptedTarget, err := decrypt(target, []byte(authKey))
+
+	// ターゲットを暗号化してDBから検索
+	encryptedTarget, err := encrypt(target, []byte(authKey))
 	if err != nil {
-		http.Error(w, "Failed to decrypt target", http.StatusInternalServerError)
+		http.Error(w, "Failed to encrypt target", http.StatusInternalServerError)
 		return
 	}
+
 	var likeCount int
-	err = db.QueryRow("SELECT like_count FROM likes WHERE encryption_key_hash = ? AND target = ?", keyHash, decryptedTarget).Scan(&likeCount)
+	err = db.QueryRow("SELECT like_count FROM likes WHERE encryption_key_hash = ? AND target = ?", keyHash, encryptedTarget).Scan(&likeCount)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			likeCount = 0
@@ -298,18 +315,15 @@ func encrypt(plainText string, key []byte) (string, error) {
 	// AESブロック暗号を作成
 	block, err := aes.NewCipher(key)
 	if err != nil {
+		log.Println(err)
 		return "", err
 	}
 
 	// 初期化ベクトルを生成
 	cipherText := make([]byte, aes.BlockSize+len(plainText))
-	iv := cipherText[:aes.BlockSize]
-	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
-		return "", err
-	}
 
 	// 暗号化処理
-	stream := cipher.NewCFBEncrypter(block, iv)
+	stream := cipher.NewCFBEncrypter(block, IV)
 	stream.XORKeyStream(cipherText[aes.BlockSize:], []byte(plainText))
 
 	// base64エンコードして返す
@@ -321,24 +335,26 @@ func decrypt(cipherText string, key []byte) (string, error) {
 	// base64デコード
 	cipherTextBytes, err := base64.URLEncoding.DecodeString(cipherText)
 	if err != nil {
+		log.Println(err)
 		return "", err
 	}
 
 	// AESブロック暗号を作成
 	block, err := aes.NewCipher(key)
 	if err != nil {
+		log.Println(err)
 		return "", err
 	}
 
 	// 初期化ベクトルを取り出す
 	if len(cipherTextBytes) < aes.BlockSize {
+		log.Println(err)
 		return "", fmt.Errorf("ciphertext too short")
 	}
-	iv := cipherTextBytes[:aes.BlockSize]
 	cipherTextBytes = cipherTextBytes[aes.BlockSize:]
 
 	// 復号化処理
-	stream := cipher.NewCFBDecrypter(block, iv)
+	stream := cipher.NewCFBDecrypter(block, IV)
 	stream.XORKeyStream(cipherTextBytes, cipherTextBytes)
 
 	// 復号化した文字列を返す
