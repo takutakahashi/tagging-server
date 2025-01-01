@@ -1,11 +1,16 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -70,6 +75,12 @@ func main() {
 		handleGetLikes(w, r, db)
 	})
 
+	http.HandleFunc("/new-key", func(w http.ResponseWriter, r *http.Request) {
+		key := newKey()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(base64.URLEncoding.EncodeToString(key))
+	})
+
 	// Start the server
 	log.Println("Server started")
 	port := os.Getenv("PORT")
@@ -109,7 +120,12 @@ func handleGetTags(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 			http.Error(w, "Failed to read from database", http.StatusInternalServerError)
 			return
 		}
-		tags = append(tags, tag)
+		decryptedTag, err := decrypt(tag, []byte(authKey))
+		if err != nil {
+			http.Error(w, "Failed to decrypt tag", http.StatusInternalServerError)
+			return
+		}
+		tags = append(tags, decryptedTag)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -145,7 +161,12 @@ func handleGetTargets(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 			http.Error(w, "Failed to read from database", http.StatusInternalServerError)
 			return
 		}
-		targets = append(targets, target)
+		decryptedTarget, err := decrypt(target, []byte(authKey))
+		if err != nil {
+			http.Error(w, "Failed to decrypt target", http.StatusInternalServerError)
+			return
+		}
+		targets = append(targets, decryptedTarget)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -176,7 +197,17 @@ func handleAddTag(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
-	_, err := db.Exec("INSERT INTO targets_tags (encryption_key_hash, target, tag) VALUES (?, ?, ?)", keyHash, req.Target, req.Tag)
+	target, err := encrypt(req.Target, []byte(authKey))
+	if err != nil {
+		http.Error(w, "Failed to encrypt target", http.StatusInternalServerError)
+		return
+	}
+	tag, err := encrypt(req.Tag, []byte(authKey))
+	if err != nil {
+		http.Error(w, "Failed to encrypt tag", http.StatusInternalServerError)
+		return
+	}
+	_, err = db.Exec("INSERT INTO targets_tags (encryption_key_hash, target, tag) VALUES (?, ?, ?)", keyHash, target, tag)
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
@@ -207,7 +238,12 @@ func handleLikeTarget(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
-	_, err := db.Exec("INSERT INTO likes (encryption_key_hash, target, like_count) VALUES (?, ?, 1) ON CONFLICT(encryption_key_hash, target) DO UPDATE SET like_count = like_count + 1", keyHash, req.Target)
+	target, err := encrypt(req.Target, []byte(authKey))
+	if err != nil {
+		http.Error(w, "Failed to encrypt target", http.StatusInternalServerError)
+		return
+	}
+	_, err = db.Exec("INSERT INTO likes (encryption_key_hash, target, like_count) VALUES (?, ?, 1) ON CONFLICT(encryption_key_hash, target) DO UPDATE SET like_count = like_count + 1", keyHash, target)
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
@@ -229,9 +265,13 @@ func handleGetLikes(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		http.Error(w, "Missing target", http.StatusBadRequest)
 		return
 	}
-
+	decryptedTarget, err := decrypt(target, []byte(authKey))
+	if err != nil {
+		http.Error(w, "Failed to decrypt target", http.StatusInternalServerError)
+		return
+	}
 	var likeCount int
-	err := db.QueryRow("SELECT like_count FROM likes WHERE encryption_key_hash = ? AND target = ?", keyHash, target).Scan(&likeCount)
+	err = db.QueryRow("SELECT like_count FROM likes WHERE encryption_key_hash = ? AND target = ?", keyHash, decryptedTarget).Scan(&likeCount)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			likeCount = 0
@@ -244,4 +284,63 @@ func handleGetLikes(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	w.Header().Set("Content-Type", "application/json")
 	response := Response{LikeCount: likeCount}
 	json.NewEncoder(w).Encode(response)
+}
+
+func newKey() []byte {
+	key := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		log.Fatal(err)
+	}
+	return key
+}
+
+func encrypt(plainText string, key []byte) (string, error) {
+	// AESブロック暗号を作成
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+
+	// 初期化ベクトルを生成
+	cipherText := make([]byte, aes.BlockSize+len(plainText))
+	iv := cipherText[:aes.BlockSize]
+	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+		return "", err
+	}
+
+	// 暗号化処理
+	stream := cipher.NewCFBEncrypter(block, iv)
+	stream.XORKeyStream(cipherText[aes.BlockSize:], []byte(plainText))
+
+	// base64エンコードして返す
+	return base64.URLEncoding.EncodeToString(cipherText), nil
+}
+
+// 復号化
+func decrypt(cipherText string, key []byte) (string, error) {
+	// base64デコード
+	cipherTextBytes, err := base64.URLEncoding.DecodeString(cipherText)
+	if err != nil {
+		return "", err
+	}
+
+	// AESブロック暗号を作成
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+
+	// 初期化ベクトルを取り出す
+	if len(cipherTextBytes) < aes.BlockSize {
+		return "", fmt.Errorf("ciphertext too short")
+	}
+	iv := cipherTextBytes[:aes.BlockSize]
+	cipherTextBytes = cipherTextBytes[aes.BlockSize:]
+
+	// 復号化処理
+	stream := cipher.NewCFBDecrypter(block, iv)
+	stream.XORKeyStream(cipherTextBytes, cipherTextBytes)
+
+	// 復号化した文字列を返す
+	return string(cipherTextBytes), nil
 }
